@@ -1,1 +1,1 @@
-@/tmp/ro_upload/telegram_mcp_runtime.py
+__CURSOR_READ_FILE__/tmp/ro_upload/telegram_mcp_runtime.py
