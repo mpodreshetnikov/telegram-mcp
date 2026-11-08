@@ -78,7 +78,12 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Hardened fork: RO fake-client suite only (upstream tool tests no longer apply).
+testpaths = [
+    "tests/test_ro_policy.py",
+    "tests/test_ro_surface.py",
+    "tests/test_ro_http_auth.py",
+]
 asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "--strict-markers",

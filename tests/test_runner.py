@@ -341,6 +341,7 @@ class _FakeSettings:
         self.host = None
         self.port = None
         self.transport_security = None
+        self.log_level = "INFO"
 
 
 class _FakeMcp:
@@ -370,18 +371,50 @@ async def test_serve_defaults_to_stdio(monkeypatch, transport):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["http", "sse"])
-async def test_serve_http_transports_bind_host_and_port(monkeypatch, transport):
+async def test_serve_http_binds_host_and_port_when_non_loopback_allowed(monkeypatch):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
     monkeypatch.setenv("MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("MCP_PORT", "9000")
+    monkeypatch.setenv("TELEGRAM_RO_ALLOW_NON_LOOPBACK", "1")
+    _stub_ro_http_stack(monkeypatch, fake)
 
-    await runner._serve(transport)
+    await runner._serve("http")
 
-    assert fake.ran == transport
+    assert fake.ran == "http"
     assert fake.settings.host == "0.0.0.0"
     assert fake.settings.port == 9000
+
+
+@pytest.mark.asyncio
+async def test_serve_sse_disabled_in_readonly_fork(monkeypatch):
+    fake = _FakeMcp()
+    monkeypatch.setattr(runner, "mcp", fake)
+
+    with pytest.raises(SystemExit, match="SSE transport is disabled"):
+        await runner._serve("sse")
+
+
+def _stub_ro_http_stack(monkeypatch, fake: _FakeMcp) -> None:
+    """RO HTTP path uses uvicorn + auth wrap, not mcp.run_streamable_http_async."""
+    monkeypatch.setenv("TELEGRAM_MCP_AUTH_TOKEN", "test-token-for-unit")
+
+    class _FakeServer:
+        def __init__(self, _config):
+            pass
+
+        async def serve(self):
+            fake.ran = "http"
+
+    monkeypatch.setattr(
+        "telegram_mcp.transport.http.create_streamable_http_app",
+        lambda _mcp: object(),
+    )
+    monkeypatch.setattr(
+        "telegram_mcp.transport.auth.wrap_http_app_with_auth",
+        lambda app: app,
+    )
+    monkeypatch.setattr("uvicorn.Server", _FakeServer)
 
 
 @pytest.mark.asyncio
@@ -390,6 +423,7 @@ async def test_serve_http_uses_default_host_and_port(monkeypatch):
     monkeypatch.setattr(runner, "mcp", fake)
     monkeypatch.delenv("MCP_HOST", raising=False)
     monkeypatch.delenv("MCP_PORT", raising=False)
+    _stub_ro_http_stack(monkeypatch, fake)
 
     await runner._serve("http")
 
@@ -400,10 +434,12 @@ async def test_serve_http_uses_default_host_and_port(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_serve_http_leaves_transport_security_unset_by_default(monkeypatch):
+    """Unset MCP_ALLOWED_HOSTS → do not overwrite FastMCP constructor defaults."""
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
     monkeypatch.delenv("MCP_ALLOWED_ORIGINS", raising=False)
+    _stub_ro_http_stack(monkeypatch, fake)
 
     await runner._serve("http")
 
@@ -414,14 +450,20 @@ async def test_serve_http_leaves_transport_security_unset_by_default(monkeypatch
 async def test_serve_http_configures_allowed_hosts(monkeypatch):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
-    monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mcp.example.com, localhost:8765")
+    monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mcp.example.com")
     monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://mcp.example.com")
+    _stub_ro_http_stack(monkeypatch, fake)
 
     await runner._serve("http")
 
     security = fake.settings.transport_security
     assert security.enable_dns_rebinding_protection is True
-    assert security.allowed_hosts == ["mcp.example.com", "localhost:8765"]
+    assert security.allowed_hosts == [
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "mcp.example.com",
+    ]
     assert security.allowed_origins == ["https://mcp.example.com"]
 
 

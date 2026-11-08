@@ -26,6 +26,11 @@ from telegram_mcp.singleton import (
     SessionLockError,
     session_identity,
 )
+# Fail-closed allowlist on untouched upstream runtime (no exec / no runtime rewrite).
+from telegram_mcp.ro_allowlist_patch import apply_to_runtime as _apply_ro_allowlist
+
+_apply_ro_allowlist(_runtime)
+
 import telegram_mcp.tools  # noqa: F401 - registers MCP tools via decorators
 
 # Populated as each account's session lock is acquired; released in _main's
@@ -183,49 +188,110 @@ async def _connect_or_skip(label, client) -> None:
         )
 
 
+# FastMCP (mcp 1.30) auto-enables DNS-rebinding protection for loopback binds
+# with exactly these Host patterns. Keep them when extending via MCP_ALLOWED_HOSTS
+# so local probes (Host: 127.0.0.1:8765) still pass behind Tailscale Serve.
+_LOOPBACK_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+
+
 def _configure_transport_security() -> None:
-    """Wire MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS into FastMCP's DNS-rebinding
-    protection, e.g. when the server sits behind a reverse proxy on a public
-    domain instead of only being reached via 127.0.0.1/localhost.
+    """Extend FastMCP Host allowlist for reverse-proxy / Tailscale Serve names.
+
+    When MCP_ALLOWED_HOSTS is unset, leave FastMCP constructor defaults alone
+    (loopback-only Hosts when bound to 127.0.0.1/localhost/::1). When set,
+    enable protection with those Hosts **merged** with loopback patterns — never
+    disable DNS-rebinding, never accept ``*`` wildcards beyond per-host ``:*``.
     """
     raw_hosts = os.getenv("MCP_ALLOWED_HOSTS", "")
-    allowed_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
-    if not allowed_hosts:
+    extra_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+    if not extra_hosts:
         return
 
     from mcp.server.transport_security import TransportSecuritySettings
 
     raw_origins = os.getenv("MCP_ALLOWED_ORIGINS", "")
-    allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    extra_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+
+    merged_hosts = list(dict.fromkeys([*_LOOPBACK_ALLOWED_HOSTS, *extra_hosts]))
 
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=allowed_origins,
+        allowed_hosts=merged_hosts,
+        allowed_origins=extra_origins,
     )
+
+
+def _enforce_readonly_fork_invariants() -> None:
+    """Abort startup if write/leak tools slipped into the registry or media cloud is on."""
+    from telegram_mcp.ro_policy import BOUNDARY_NOTICE, RO_ALLOWED_TOOLS
+
+    os.environ["TELEGRAM_TRANSCRIBE"] = "off"
+    if (os.getenv("TELEGRAM_MEDIA_BASE_URL") or "").strip():
+        raise SystemExit(
+            "Refusing to start: TELEGRAM_MEDIA_BASE_URL is forbidden in the "
+            "read-only fork (no unauthenticated media URL surface)."
+        )
+
+    registered = {tool.name for tool in mcp._tool_manager.list_tools()}
+    unexpected = sorted(registered - RO_ALLOWED_TOOLS)
+    missing = sorted(RO_ALLOWED_TOOLS - registered)
+    if unexpected:
+        raise SystemExit(
+            "Refusing to start: non-read-only tools registered: "
+            + ", ".join(unexpected)
+        )
+    if missing:
+        raise SystemExit(
+            "Refusing to start: required read-only tools missing: " + ", ".join(missing)
+        )
+    print(BOUNDARY_NOTICE, file=sys.stderr)
 
 
 async def _serve(transport: str) -> None:
     """Run the MCP server on the selected transport.
 
-    HTTP transports let one long-lived process hold a single shared Telegram
-    connection while multiple local MCP clients connect over HTTP, instead of
-    each client spawning its own Telethon session (which Telegram
-    throttles/flags). "http" is streamable HTTP — the current MCP transport
-    that Claude Code (`--transport http`) and Codex (`--url`) speak natively;
-    "sse" is kept for clients that only support the legacy SSE transport.
+    Hardened fork: stdio is default. HTTP requires TELEGRAM_MCP_AUTH_TOKEN
+    and binds to 127.0.0.1 by default — no public unauthenticated endpoint.
+    Legacy SSE is rejected (no auth wrapper).
     """
-    if transport in ("http", "sse"):
+    if transport == "sse":
+        raise SystemExit(
+            "SSE transport is disabled in the read-only fork. Use MCP_TRANSPORT=stdio "
+            "or MCP_TRANSPORT=http with TELEGRAM_MCP_AUTH_TOKEN."
+        )
+    if transport == "http":
+        from telegram_mcp.ro_policy import require_http_auth_token
+        from telegram_mcp.transport.auth import wrap_http_app_with_auth
+        from telegram_mcp.transport.http import create_streamable_http_app
+        import uvicorn
+
+        require_http_auth_token()
         mcp.settings.host = os.getenv("MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.getenv("MCP_PORT", "8765"))
+        host = mcp.settings.host
+        if host not in ("127.0.0.1", "localhost", "::1") and not (
+            os.getenv("TELEGRAM_RO_ALLOW_NON_LOOPBACK") or ""
+        ).strip():
+            raise SystemExit(
+                f"Refusing HTTP bind to '{host}': set MCP_HOST=127.0.0.1 or "
+                "explicitly set TELEGRAM_RO_ALLOW_NON_LOOPBACK=1 after reviewing exposure."
+            )
         _configure_transport_security()
-        if transport == "http":
-            await mcp.run_streamable_http_async()
-        else:
-            await mcp.run_sse_async()
-    else:
-        # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        app = wrap_http_app_with_auth(create_streamable_http_app(mcp))
+        config = uvicorn.Config(
+            app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=str(mcp.settings.log_level).lower(),
+        )
+        print(
+            "HTTP MCP auth enabled (Bearer TELEGRAM_MCP_AUTH_TOKEN).",
+            file=sys.stderr,
+        )
+        await uvicorn.Server(config).serve()
+        return
+
+    await mcp.run_stdio_async()
 
 
 async def _main() -> None:
@@ -336,27 +402,11 @@ def main() -> None:
         os.environ["MCP_HOST"] = host
     if port is not None:
         os.environ["MCP_PORT"] = str(port)
-    # Before _apply_exposed_tools_mode(): that prunes non-exposed tools from
-    # the tool manager, and the extension overrides validate tool names
-    # against that same manager. Narrowing send_file's extensions while
-    # send_file is not exposed is a valid configuration, so the name check
-    # has to see the full tool set.
-    _runtime._apply_file_extension_overrides()
-    hidden, excluded = _runtime._apply_exposed_tools_mode()
-    if hidden:
-        # These names are the menu for the "+" allowlist; without this line the
-        # only way to find them is reading the tool annotations in the source.
-        print(
-            f"TELEGRAM_EXPOSED_TOOLS hides {len(hidden)} tool(s); list any of them "
-            f"after '+' to expose it: {', '.join(sorted(hidden))}",
-            file=sys.stderr,
-        )
-    if excluded:
-        print(
-            f"TELEGRAM_EXPOSED_TOOLS excludes {len(excluded)} tool(s) listed "
-            f"after '-': {', '.join(sorted(excluded))}",
-            file=sys.stderr,
-        )
+    # Hardened fork: tool surface is fixed by telegram_mcp.tools.ro_surface;
+    # ignore upstream TELEGRAM_EXPOSED_TOOLS expansion (+write) entirely.
+    os.environ["TELEGRAM_EXPOSED_TOOLS"] = "read-only"
+    os.environ.setdefault("TELEGRAM_TRANSCRIBE", "off")
+    _enforce_readonly_fork_invariants()
     _transcription.validate_transcription_config()
     _session_lock_shared()  # fail loudly at startup on a bad toggle
     asyncio.run(_main())
