@@ -537,12 +537,13 @@ For `http` and `sse`, the server binds `MCP_HOST`:`MCP_PORT` (default
 `127.0.0.1:8765`); the streamable HTTP endpoint is `/mcp`, the SSE endpoint is
 `/sse`.
 
-If the server is reachable via a domain (e.g. behind a reverse proxy) rather
-than only `127.0.0.1`/`localhost`, set `MCP_ALLOWED_HOSTS` (and optionally
-`MCP_ALLOWED_ORIGINS`) to enable DNS-rebinding protection and allow that Host
-header, e.g. `MCP_ALLOWED_HOSTS=mcp.example.com`. Comma-separated; supports a
-`:*` suffix to allow any port. Left unset, DNS-rebinding protection stays off
-(the historical default).
+For loopback binds, mcp 1.30 FastMCP enables DNS-rebinding protection by
+default and allows only `127.0.0.1:*` / `localhost:*` / `[::1]:*`. If clients
+reach the server via a reverse proxy or Tailscale Serve hostname, set
+`MCP_ALLOWED_HOSTS` (and optionally `MCP_ALLOWED_ORIGINS`) to that Host, e.g.
+`MCP_ALLOWED_HOSTS=mcp.example.com`. Comma-separated; supports a `:*` suffix
+to allow any port. Loopback patterns are merged in automatically. Do not
+disable DNS-rebinding or use a global `*` host wildcard.
 
 Prefer `http` when more than one MCP client (or many coding-agent sessions)
 will use the server: a single long-lived process holds one Telegram

@@ -188,25 +188,36 @@ async def _connect_or_skip(label, client) -> None:
         )
 
 
+# FastMCP (mcp 1.30) auto-enables DNS-rebinding protection for loopback binds
+# with exactly these Host patterns. Keep them when extending via MCP_ALLOWED_HOSTS
+# so local probes (Host: 127.0.0.1:8765) still pass behind Tailscale Serve.
+_LOOPBACK_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+
+
 def _configure_transport_security() -> None:
-    """Wire MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS into FastMCP's DNS-rebinding
-    protection, e.g. when the server sits behind a reverse proxy on a public
-    domain instead of only being reached via 127.0.0.1/localhost.
+    """Extend FastMCP Host allowlist for reverse-proxy / Tailscale Serve names.
+
+    When MCP_ALLOWED_HOSTS is unset, leave FastMCP constructor defaults alone
+    (loopback-only Hosts when bound to 127.0.0.1/localhost/::1). When set,
+    enable protection with those Hosts **merged** with loopback patterns — never
+    disable DNS-rebinding, never accept ``*`` wildcards beyond per-host ``:*``.
     """
     raw_hosts = os.getenv("MCP_ALLOWED_HOSTS", "")
-    allowed_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
-    if not allowed_hosts:
+    extra_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+    if not extra_hosts:
         return
 
     from mcp.server.transport_security import TransportSecuritySettings
 
     raw_origins = os.getenv("MCP_ALLOWED_ORIGINS", "")
-    allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    extra_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+
+    merged_hosts = list(dict.fromkeys([*_LOOPBACK_ALLOWED_HOSTS, *extra_hosts]))
 
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=allowed_origins,
+        allowed_hosts=merged_hosts,
+        allowed_origins=extra_origins,
     )
 
 
