@@ -1,1 +1,1 @@
-cursor-file:///tmp/ro_upload/telegram_mcp_runtime.py
+<<<FILE:/tmp/ro_upload/telegram_mcp_runtime.py>>>
