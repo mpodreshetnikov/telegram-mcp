@@ -7,9 +7,19 @@ from __future__ import annotations
 from pathlib import Path
 
 _dir = Path(__file__).resolve().parent
-_src = (_dir / "runtime_body_a.py").read_text(encoding="utf-8") + (
-    _dir / "runtime_body_b.py"
-).read_text(encoding="utf-8")
+_parts = [
+    'runtime_body_a0.py',
+    'runtime_body_a1.py',
+    'runtime_body_a2.py',
+    'runtime_body_a3.py',
+    'runtime_body_a4.py',
+    'runtime_body_b0.py',
+    'runtime_body_b1.py',
+    'runtime_body_b2.py',
+    'runtime_body_b3.py',
+    'runtime_body_b4.py',
+]
+_src = "".join((_dir / p).read_text(encoding="utf-8") for p in _parts)
 exec(compile(_src, str(_dir / "runtime.py"), "exec"), globals())
 
 from telegram_mcp import ro_allowlist_patch as _ro_allowlist_patch
